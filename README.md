@@ -150,9 +150,13 @@ When you create a profile, Git Switch:
 
 3. **Updates Global Config** (`~/.gitconfig`)
    ```ini
-   [includeIf "gitdir:~/Projects/Work/"]
-       path = ~/.gitconfig_work
+   [includeIf "gitdir:/Users/you/Projects/Work/"]
+       path = /Users/you/.gitconfig_work
    ```
+   Folder paths are stored as absolute, fully-resolved paths (symlinks like
+   `/tmp` → `/private/tmp` are canonicalized) so they match the path Git actually
+   tests. Blocks are kept sorted by specificity — the most specific folder wins, so
+   a profile for `…/Projects/Work/Client` correctly overrides one for `…/Projects/Work`.
 
 ### The Magic
 
@@ -164,8 +168,9 @@ When you run any Git command in a folder matching the `gitdir` pattern, Git auto
 
 ### Requirements
 
-- macOS 13.0 (Ventura) or later
-- Xcode 15.0 or later
+- macOS 14.0 (Sonoma) or later
+- Xcode 16.0 or later
+- `git` available on your `PATH` (the app shells out to it)
 
 ### Steps
 
@@ -193,18 +198,10 @@ When you run any Git command in a folder matching the `gitdir` pattern, Git auto
 
 ### Creating a DMG
 
+Use the bundled script, which auto-detects the built app's version and packages it:
+
 ```bash
-# Create a temporary directory
-mkdir -p ~/Desktop/GitSwitch-Release
-
-# Copy the app (after archiving and exporting)
-cp -R "/path/to/Git Switch.app" ~/Desktop/GitSwitch-Release/
-
-# Create DMG
-hdiutil create -volname "Git Switch" \
-  -srcfolder ~/Desktop/GitSwitch-Release \
-  -ov -format UDZO \
-  ~/Desktop/GitSwitch.dmg
+./scripts/create-dmg.sh "/path/to/Git Switch.app"
 ```
 
 ## Permissions
@@ -214,6 +211,11 @@ Git Switch requires the following permissions:
 | Permission | Reason |
 |------------|--------|
 | File System Access | Read/write Git config files and SSH keys |
+
+> **Note:** Git Switch is intentionally **not sandboxed** — it must read and write
+> `~/.gitconfig` and `~/.ssh` and run `git`/`ssh-keygen`/`ssh-add`. As a result it
+> **cannot be distributed via the Mac App Store**; distribute it as a Developer ID
+> signed + notarized DMG (or run it locally from a build).
 
 ## Troubleshooting
 

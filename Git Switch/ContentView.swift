@@ -7,6 +7,7 @@ import Combine
 struct MenuBarView: View {
     @ObservedObject var manager: GitManager
     @ObservedObject var themeManager: ThemeManager
+    @Environment(\.openWindow) private var openWindow
     @State private var refreshRotation: Double = 0
     
     var body: some View {
@@ -102,9 +103,7 @@ struct MenuBarView: View {
     
     private func openMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue != "menu-bar" }) {
-            window.makeKeyAndOrderFront(nil)
-        }
+        openWindow(id: "main")
     }
 }
 
@@ -215,29 +214,18 @@ struct MenuBarProfileRow: View {
 }
 
 // MARK: - LOGIC LAYER
-
-class Shell {
-    @discardableResult
-    static func run(_ command: String) -> String {
-        let task = Process()
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = pipe
-        task.arguments = ["-c", command]
-        task.launchPath = "/bin/zsh"
-        do { try task.run() } catch { return "" }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
-}
+// `Shell` lives in Shell.swift — it runs executables via argv (no shell), so user
+// input can never be interpreted as shell syntax.
 
 struct GitProfile: Identifiable, Equatable {
-    let id = UUID()
     var folder: String
     var name: String
     var email: String
     var configPath: String
     var includeBlock: String
+    // Stable identity derived from durable data (configPath is unique per profile),
+    // so SwiftUI diffing/animations and sheet(item:) survive a refresh.
+    var id: String { configPath }
 }
 
 class GitManager: ObservableObject {
@@ -254,8 +242,11 @@ class GitManager: ObservableObject {
     func refreshAll() {
         withAnimation(.easeOut(duration: 0.2)) { isLoading = true }
         DispatchQueue.global(qos: .userInitiated).async {
-            let gName = Shell.run("git config --global user.name")
-            let gEmail = Shell.run("git config --global user.email")
+            // Heal any pre-existing config whose includeIf blocks are in the wrong
+            // (creation) order so the most specific folder wins.
+            self.normalizeGlobalConfigOrder()
+            let gName = Shell.run("git", ["config", "--global", "user.name"])
+            let gEmail = Shell.run("git", ["config", "--global", "user.email"])
             let loadedProfiles = self.fetchProfiles()
             
             DispatchQueue.main.async {
@@ -270,100 +261,129 @@ class GitManager: ObservableObject {
     }
 
     func saveGlobalConfig(name: String, email: String) {
-        Shell.run("git config --global user.name \"\(name)\"")
-        Shell.run("git config --global user.email \"\(email)\"")
+        Shell.run("git", ["config", "--global", "user.name", name])
+        Shell.run("git", ["config", "--global", "user.email", email])
         refreshAll()
     }
 
     private func fetchProfiles() -> [GitProfile] {
         guard let content = try? String(contentsOfFile: globalConfigPath, encoding: .utf8) else { return [] }
-        var found: [GitProfile] = []
-        let pattern = #"(?ms)(\[includeIf "gitdir:(.*?)"\]\s+path\s+=\s+(.*?)\n)"#
-        let regex = try! NSRegularExpression(pattern: pattern, options: [])
-        let nsString = content as NSString
-        let results = regex.matches(in: content, options: [], range: NSRange(location: 0, length: nsString.length))
-        
-        for result in results {
-            let fullBlock = nsString.substring(with: result.range(at: 1))
-            let folder = nsString.substring(with: result.range(at: 2))
-            let configPath = nsString.substring(with: result.range(at: 3)).trimmingCharacters(in: .whitespacesAndNewlines)
-            let details = readProfileDetails(path: configPath)
-            found.append(GitProfile(folder: folder, name: details.name, email: details.email, configPath: configPath, includeBlock: fullBlock))
+        return parseIncludeBlocks(in: content).map { parsed in
+            let details = readProfileDetails(path: parsed.configPath)
+            return GitProfile(folder: parsed.folder, name: details.name, email: details.email,
+                              configPath: parsed.configPath, includeBlock: parsed.block)
         }
-        return found
     }
-    
+
     private func readProfileDetails(path: String) -> (name: String, email: String) {
         let expandedPath = NSString(string: path).expandingTildeInPath
-        guard let content = try? String(contentsOfFile: expandedPath, encoding: .utf8) else { return ("Unknown", "Unknown") }
-        var name = "Unknown", email = "Unknown"
-        content.enumerateLines { line, _ in
-            if let range = line.range(of: "name =") { name = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces) }
-            if let range = line.range(of: "email =") { email = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces) }
-        }
-        return (name, email)
+        guard FileManager.default.fileExists(atPath: expandedPath) else { return ("Missing config", "—") }
+        // Read via git's own parser instead of substring matching — robust to formatting.
+        let name = Shell.run("git", ["config", "-f", expandedPath, "user.name"])
+        let email = Shell.run("git", ["config", "-f", expandedPath, "user.email"])
+        return (name.isEmpty ? "Unknown" : name, email.isEmpty ? "Unknown" : email)
     }
 
-    func createProfile(name: String, email: String, folder: String, completion: @escaping () -> Void) {
+    /// Creates a new context profile. `completion` is called on the main thread with
+    /// `nil` on success, or a user-facing error message on failure.
+    func createProfile(name: String, email: String, folder: String, completion: @escaping (String?) -> Void) {
         DispatchQueue.global().async {
-            let safeName = name.lowercased().replacingOccurrences(of: " ", with: "_")
-            let keyFile = "\(self.sshDir)/id_ed25519_\(safeName)"
-            let configPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gitconfig_\(safeName)").path
+            // Resolve symlinks / ~ / .. and strip trailing slashes so the gitdir pattern
+            // matches the path Git actually tests (e.g. /tmp -> /private/tmp).
+            let canonicalFolder = normalizeFolderPath(folder)
+            let currentGlobal = (try? String(contentsOfFile: self.globalConfigPath, encoding: .utf8)) ?? ""
 
-            if !FileManager.default.fileExists(atPath: self.sshDir) { try? FileManager.default.createDirectory(atPath: self.sshDir, withIntermediateDirectories: true) }
+            // Reject a second profile for a folder that already has one — two includeIf
+            // blocks for the same gitdir would just shadow each other (last-match-wins).
+            if existingGitdirFolders(in: currentGlobal).contains(canonicalFolder) {
+                DispatchQueue.main.async { completion("A profile for this folder already exists.") }
+                return
+            }
+
+            // Filesystem-safe, unique base for the key + config filenames so two profiles
+            // (e.g. "Work" and "work") can never overwrite each other's files.
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let slug = uniqueSlug(sanitizeProfileSlug(name)) { candidate in
+                FileManager.default.fileExists(atPath: "\(self.sshDir)/id_ed25519_\(candidate)") ||
+                FileManager.default.fileExists(atPath: home.appendingPathComponent(".gitconfig_\(candidate)").path)
+            }
+            let keyFile = "\(self.sshDir)/id_ed25519_\(slug)"
+            let configPath = home.appendingPathComponent(".gitconfig_\(slug)").path
+
+            // ~/.ssh must be 0700 or ssh refuses to use keys in it.
+            if !FileManager.default.fileExists(atPath: self.sshDir) {
+                try? FileManager.default.createDirectory(atPath: self.sshDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            } else {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: self.sshDir)
+            }
             if !FileManager.default.fileExists(atPath: keyFile) {
-                Shell.run("ssh-keygen -t ed25519 -C \"\(email)\" -f \"\(keyFile)\" -N \"\"")
+                Shell.run("ssh-keygen", ["-t", "ed25519", "-C", email, "-f", keyFile, "-N", ""])
             }
-            Shell.run("ssh-add --apple-use-keychain \"\(keyFile)\"")
-            
+            Shell.run("ssh-add", ["--apple-use-keychain", keyFile])
+
             self.writeLocalConfig(path: configPath, name: name, email: email, keyFile: keyFile)
-            
-            let includeDirective = "\n[includeIf \"gitdir:\(folder)/\"]\n    path = \(configPath)\n"
-            if let currentGlobal = try? String(contentsOfFile: self.globalConfigPath, encoding: .utf8) {
-                if !currentGlobal.contains(configPath) {
-                    let newGlobal = currentGlobal + includeDirective
-                    try? newGlobal.write(toFile: self.globalConfigPath, atomically: true, encoding: .utf8)
-                }
-            }
-            DispatchQueue.main.async { self.refreshAll(); completion() }
+
+            // Exactly one trailing slash, even if the user typed one.
+            let includeDirective = "\n[includeIf \"gitdir:\(canonicalFolder)/\"]\n    path = \(configPath)\n"
+            // Reorder so the most specific folder wins (Git applies all matching
+            // includeIf blocks, last-match-wins) instead of relying on creation order.
+            let newGlobal = reorderGitIncludeBlocks(in: currentGlobal + includeDirective)
+            try? newGlobal.write(toFile: self.globalConfigPath, atomically: true, encoding: .utf8)
+
+            DispatchQueue.main.async { self.refreshAll(); completion(nil) }
         }
     }
     
     func updateProfile(profile: GitProfile, newName: String, newEmail: String) {
-        let expandedPath = NSString(string: profile.configPath).expandingTildeInPath
-        guard let content = try? String(contentsOfFile: expandedPath, encoding: .utf8) else { return }
-        var keyPath = ""
-        if let range = content.range(of: "sshCommand = \"ssh -i ") {
-             keyPath = String(content[range.upperBound...].split(separator: "\"").first ?? "")
+        DispatchQueue.global().async {
+            let expandedPath = NSString(string: profile.configPath).expandingTildeInPath
+            // Use git's own writer so [core] sshCommand and any other keys are preserved
+            // (the old code rewrote the whole file and could blank out the SSH key).
+            Shell.run("git", ["config", "-f", expandedPath, "user.name", newName])
+            Shell.run("git", ["config", "-f", expandedPath, "user.email", newEmail])
+            DispatchQueue.main.async { self.refreshAll() }
         }
-        writeLocalConfig(path: expandedPath, name: newName, email: newEmail, keyFile: keyPath)
-        refreshAll()
     }
-    
+
     func deleteProfile(_ profile: GitProfile) {
-        if let currentGlobal = try? String(contentsOfFile: globalConfigPath, encoding: .utf8) {
-            let newGlobal = currentGlobal.replacingOccurrences(of: profile.includeBlock, with: "")
-            try? newGlobal.write(toFile: globalConfigPath, atomically: true, encoding: .utf8)
+        DispatchQueue.global().async {
+            if let currentGlobal = try? String(contentsOfFile: self.globalConfigPath, encoding: .utf8) {
+                // Remove the block structurally (by its config-path target) and re-sort,
+                // instead of a fragile literal substring match.
+                let newGlobal = gitConfigRemovingBlock(configPath: profile.configPath, from: currentGlobal)
+                try? newGlobal.write(toFile: self.globalConfigPath, atomically: true, encoding: .utf8)
+            }
+            // SSH key files are intentionally preserved (documented behavior).
+            try? FileManager.default.removeItem(atPath: NSString(string: profile.configPath).expandingTildeInPath)
+            DispatchQueue.main.async { self.refreshAll() }
         }
-        try? FileManager.default.removeItem(atPath: NSString(string: profile.configPath).expandingTildeInPath)
-        refreshAll()
     }
-    
+
     func copySSHKey(for profile: GitProfile) -> Bool {
         let expandedPath = NSString(string: profile.configPath).expandingTildeInPath
-        guard let content = try? String(contentsOfFile: expandedPath, encoding: .utf8),
-              let range = content.range(of: "ssh -i ") else { return false }
-        let keyPath = content[range.upperBound...].components(separatedBy: "\"").first ?? ""
-        let pubKeyPath = keyPath + ".pub"
-        if let pubKey = try? String(contentsOfFile: pubKeyPath, encoding: .utf8) {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(pubKey, forType: .string)
-            return true
-        }
-        return false
+        // core.sshCommand looks like: ssh -i <keypath>
+        let sshCommand = Shell.run("git", ["config", "-f", expandedPath, "core.sshCommand"])
+        guard let range = sshCommand.range(of: "-i ") else { return false }
+        let keyPath = String(sshCommand[range.upperBound...])
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \""))
+        guard let pubKey = try? String(contentsOfFile: keyPath + ".pub", encoding: .utf8) else { return false }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(pubKey, forType: .string)
+        return true
     }
     
+    /// Rewrites ~/.gitconfig so includeIf blocks are ordered by folder specificity
+    /// (deepest last). Safe: only writes when ordering actually changes, writes
+    /// atomically, and preserves every block.
+    private func normalizeGlobalConfigOrder() {
+        guard let content = try? String(contentsOfFile: globalConfigPath, encoding: .utf8) else { return }
+        let reordered = reorderGitIncludeBlocks(in: content)
+        if reordered != content {
+            try? reordered.write(toFile: globalConfigPath, atomically: true, encoding: .utf8)
+        }
+    }
+
     private func writeLocalConfig(path: String, name: String, email: String, keyFile: String) {
         let configContent = """
 [user]
@@ -906,8 +926,13 @@ struct AddProfileSheet: View {
     @State private var email = ""
     @State private var folder = ""
     @State private var isGenerating = false
-    
-    var isValid: Bool { !name.isEmpty && !email.isEmpty && !folder.isEmpty }
+    @State private var errorMessage: String?
+
+    var isValid: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        isValidEmail(email.trimmingCharacters(in: .whitespacesAndNewlines)) &&
+        !folder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     
     var body: some View {
         VStack(spacing: 24) {
@@ -956,7 +981,24 @@ struct AddProfileSheet: View {
                     }
                 }
             }
-            
+
+            if let errorMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                    Text(errorMessage)
+                        .font(.system(size: 11))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .foregroundColor(.red)
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.red.opacity(0.1))
+                )
+            }
+
             // Actions
             HStack(spacing: 12) {
                 Button("Cancel") { dismiss() }
@@ -1001,10 +1043,26 @@ struct AddProfileSheet: View {
     }
     
     func create() {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedFolder = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var isDir: ObjCBool = false
+        let expandedFolder = (trimmedFolder as NSString).expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: expandedFolder, isDirectory: &isDir), isDir.boolValue else {
+            errorMessage = "That folder doesn't exist."
+            return
+        }
+
         isGenerating = true
-        manager.createProfile(name: name, email: email, folder: folder) {
+        errorMessage = nil
+        manager.createProfile(name: trimmedName, email: trimmedEmail, folder: trimmedFolder) { error in
             isGenerating = false
-            dismiss()
+            if let error = error {
+                errorMessage = error
+            } else {
+                dismiss()
+            }
         }
     }
 }
@@ -1124,7 +1182,7 @@ struct SettingsFooter: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.secondary)
             Spacer()
-            Text("v1.0")
+            Text("v1.0.1")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
         }

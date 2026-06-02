@@ -54,8 +54,25 @@ fi
 
 echo -e "📦 Found app at: ${GREEN}$APP_PATH${NC}"
 
-# Create temp directory
+# Detect version from the built app's Info.plist (falls back to the default above)
+PLIST="$APP_PATH/Contents/Info.plist"
+if [ -f "$PLIST" ]; then
+    DETECTED=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST" 2>/dev/null || true)
+    [ -n "$DETECTED" ] && VERSION="$DETECTED"
+fi
+echo -e "🏷  Version: ${GREEN}${VERSION}${NC}"
+
+# Best-effort signing / Gatekeeper check (a notarized Developer ID build is needed
+# for friction-free distribution; an unsigned app triggers Gatekeeper warnings).
+if codesign --verify --deep --strict "$APP_PATH" >/dev/null 2>&1; then
+    echo -e "🔏 Code signature: ${GREEN}valid${NC}"
+else
+    echo -e "${RED}⚠  Not validly signed — recipients will hit Gatekeeper. Sign with Developer ID and notarize for distribution.${NC}"
+fi
+
+# Create temp directory (cleaned up on any exit)
 TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
 DMG_DIR="$TEMP_DIR/dmg"
 mkdir -p "$DMG_DIR"
 
@@ -70,8 +87,9 @@ ln -s /Applications "$DMG_DIR/Applications"
 # Create background folder and add instructions
 mkdir -p "$DMG_DIR/.background"
 
-# Output location
-OUTPUT_DIR="$HOME/Desktop"
+# Output location (optional 2nd argument; defaults to the Desktop)
+OUTPUT_DIR="${2:-$HOME/Desktop}"
+mkdir -p "$OUTPUT_DIR"
 OUTPUT_DMG="$OUTPUT_DIR/${DMG_NAME}-${VERSION}.dmg"
 TEMP_DMG="$TEMP_DIR/temp.dmg"
 
