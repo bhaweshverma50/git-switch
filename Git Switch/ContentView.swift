@@ -8,6 +8,7 @@ struct MenuBarView: View {
     @ObservedObject var manager: GitManager
     @ObservedObject var themeManager: ThemeManager
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var refreshRotation: Double = 0
     
     var body: some View {
@@ -20,7 +21,7 @@ struct MenuBarView: View {
                         .frame(width: 24, height: 24)
                     Image(systemName: "arrow.triangle.branch")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.white)
+                        .foregroundColor(themeManager.accentForeground)
                 }
                 
                 Text("Git Switch")
@@ -29,8 +30,8 @@ struct MenuBarView: View {
                 Spacer()
                 
                 Button(action: {
-                    withAnimation(.linear(duration: 0.6)) {
-                        refreshRotation += 360
+                    if !reduceMotion {
+                        withAnimation(.linear(duration: 0.6)) { refreshRotation += 360 }
                     }
                     manager.refreshAll()
                 }) {
@@ -43,6 +44,8 @@ struct MenuBarView: View {
                         .background(Circle().fill(Color.primary.opacity(0.06)))
                 }
                 .buttonStyle(ScaleButtonStyle())
+                .accessibilityLabel("Refresh")
+                .help("Refresh")
                 .disabled(manager.isLoading)
                 .opacity(manager.isLoading ? 0.5 : 1)
             }
@@ -67,7 +70,7 @@ struct MenuBarView: View {
                     }
                     .padding(12)
                 }
-                .frame(maxHeight: 200)
+                .frame(maxHeight: 260)
             }
             
             Divider()
@@ -77,7 +80,7 @@ struct MenuBarView: View {
                 Button(action: openMainWindow) {
                     HStack(spacing: 4) {
                         Image(systemName: "macwindow")
-                            .font(.system(size: 10))
+                            .font(.system(size: 11))
                         Text("Open App")
                             .font(.system(size: 11, weight: .medium))
                     }
@@ -119,18 +122,18 @@ struct MenuBarGlobalIdentity: View {
                     .frame(width: 32, height: 32)
                 Text(initials)
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundColor(.white)
+                    .foregroundColor(themeManager.accentForeground)
             }
             
             VStack(alignment: .leading, spacing: 2) {
                 Text("Global Identity")
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.secondary)
-                Text(manager.globalName.isEmpty ? "Not Set" : manager.globalName)
+                Text(manager.globalName.isEmpty ? "Not configured" : manager.globalName)
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
                 Text(manager.globalEmail.isEmpty ? "—" : manager.globalEmail)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
             }
@@ -176,7 +179,7 @@ struct MenuBarProfileRow: View {
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
                 Text(profile.folder)
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -186,12 +189,13 @@ struct MenuBarProfileRow: View {
             
             Button(action: copyKey) {
                 Image(systemName: isCopied ? "checkmark" : "key.fill")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundColor(isCopied ? .green : .secondary)
                     .frame(width: 22, height: 22)
                     .background(Circle().fill(Color.primary.opacity(0.06)))
             }
             .buttonStyle(ScaleButtonStyle())
+            .accessibilityLabel(isCopied ? "Copied" : "Copy SSH key")
             .help("Copy SSH Key")
         }
         .padding(8)
@@ -233,11 +237,17 @@ class GitManager: ObservableObject {
     @Published var globalName: String = ""
     @Published var globalEmail: String = ""
     @Published var isLoading = false
-    
+    /// Set when a write/operation fails; surfaced as an alert so failures aren't silent.
+    @Published var lastError: String?
+
     private let globalConfigPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gitconfig").path
     private let sshDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh").path
 
     init() { refreshAll() }
+
+    private func reportError(_ message: String) {
+        DispatchQueue.main.async { self.lastError = message }
+    }
     
     func refreshAll() {
         withAnimation(.easeOut(duration: 0.2)) { isLoading = true }
@@ -328,7 +338,12 @@ class GitManager: ObservableObject {
             // Reorder so the most specific folder wins (Git applies all matching
             // includeIf blocks, last-match-wins) instead of relying on creation order.
             let newGlobal = reorderGitIncludeBlocks(in: currentGlobal + includeDirective)
-            try? newGlobal.write(toFile: self.globalConfigPath, atomically: true, encoding: .utf8)
+            do {
+                try newGlobal.write(toFile: self.globalConfigPath, atomically: true, encoding: .utf8)
+            } catch {
+                DispatchQueue.main.async { completion("Couldn't update ~/.gitconfig — check file permissions.") }
+                return
+            }
 
             DispatchQueue.main.async { self.refreshAll(); completion(nil) }
         }
@@ -351,7 +366,11 @@ class GitManager: ObservableObject {
                 // Remove the block structurally (by its config-path target) and re-sort,
                 // instead of a fragile literal substring match.
                 let newGlobal = gitConfigRemovingBlock(configPath: profile.configPath, from: currentGlobal)
-                try? newGlobal.write(toFile: self.globalConfigPath, atomically: true, encoding: .utf8)
+                do {
+                    try newGlobal.write(toFile: self.globalConfigPath, atomically: true, encoding: .utf8)
+                } catch {
+                    self.reportError("Couldn't update ~/.gitconfig — check file permissions.")
+                }
             }
             // SSH key files are intentionally preserved (documented behavior).
             try? FileManager.default.removeItem(atPath: NSString(string: profile.configPath).expandingTildeInPath)
@@ -392,7 +411,11 @@ class GitManager: ObservableObject {
 [core]
     sshCommand = "ssh -i \(keyFile)"
 """
-        try? configContent.write(toFile: path, atomically: true, encoding: .utf8)
+        do {
+            try configContent.write(toFile: path, atomically: true, encoding: .utf8)
+        } catch {
+            reportError("Couldn't write the profile config file.")
+        }
     }
 }
 
@@ -406,17 +429,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
     var displayName: String {
         rawValue.capitalized
     }
-    
-    var color: Color {
-        switch self {
-        case .blue: return Color(nsColor: NSColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0))
-        case .purple: return Color(nsColor: NSColor(red: 0.69, green: 0.32, blue: 0.87, alpha: 1.0))
-        case .pink: return Color(nsColor: NSColor(red: 0.94, green: 0.28, blue: 0.5, alpha: 1.0))
-        case .orange: return Color(nsColor: NSColor(red: 1.0, green: 0.58, blue: 0.0, alpha: 1.0))
-        case .green: return Color(nsColor: NSColor(red: 0.2, green: 0.78, blue: 0.35, alpha: 1.0))
-        case .teal: return Color(nsColor: NSColor(red: 0.0, green: 0.73, blue: 0.82, alpha: 1.0))
-        }
-    }
+    // `color`, `rgb`, and `onAccent` are defined in Theme.swift (single RGB source in Contrast.swift).
 }
 
 enum AppearanceMode: String, CaseIterable, Identifiable {
@@ -448,7 +461,12 @@ class ThemeManager: ObservableObject {
     var accentColor: Color {
         selectedTheme.color
     }
-    
+
+    /// Legible foreground (black/white) for text/glyphs drawn on the accent color.
+    var accentForeground: Color {
+        selectedTheme.onAccent
+    }
+
     func applyAppearance() {
         switch appearanceMode {
         case .system:
@@ -467,10 +485,9 @@ struct ContentView: View {
     @ObservedObject var manager: GitManager
     @ObservedObject var themeManager: ThemeManager
     @State private var showingAddSheet = false
-    @State private var showingSettings = false
-    
+
     var body: some View {
-        MainView(manager: manager, themeManager: themeManager, showingAddSheet: $showingAddSheet, showingSettings: $showingSettings)
+        MainView(manager: manager, themeManager: themeManager, showingAddSheet: $showingAddSheet)
             .frame(minWidth: 600, minHeight: 500)
             .onAppear { themeManager.applyAppearance() }
             .onChange(of: themeManager.appearanceMode) { _, _ in
@@ -479,9 +496,6 @@ struct ContentView: View {
             .sheet(isPresented: $showingAddSheet) {
                 AddProfileSheet(manager: manager, themeManager: themeManager)
             }
-            .sheet(isPresented: $showingSettings) {
-                SettingsSheet(themeManager: themeManager)
-            }
     }
 }
 
@@ -489,7 +503,7 @@ struct MainView: View {
     @ObservedObject var manager: GitManager
     @ObservedObject var themeManager: ThemeManager
     @Binding var showingAddSheet: Bool
-    @Binding var showingSettings: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var editingProfile: GitProfile?
     @State private var appeared = false
     
@@ -501,8 +515,7 @@ struct MainView: View {
                     themeManager: themeManager,
                     isLoading: manager.isLoading,
                     onRefresh: { manager.refreshAll() },
-                    onAdd: { showingAddSheet = true },
-                    onSettings: { showingSettings = true }
+                    onAdd: { showingAddSheet = true }
                 )
                 .padding(.horizontal, 32)
                 .padding(.top, 20)
@@ -516,7 +529,7 @@ struct MainView: View {
                 // Profiles Section
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
-                        Text("Context Profiles")
+                        Text("Profiles")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundColor(.secondary)
                             .textCase(.uppercase)
@@ -542,10 +555,11 @@ struct MainView: View {
                                     editingProfile = profile
                                 }
                                 .opacity(appeared ? 1 : 0)
-                                .offset(y: appeared ? 0 : 15)
+                                .offset(y: appeared || reduceMotion ? 0 : 15)
                                 .animation(
-                                    .spring(response: 0.4, dampingFraction: 0.8)
-                                    .delay(Double(index) * 0.05 + 0.15),
+                                    reduceMotion ? nil :
+                                        .spring(response: 0.4, dampingFraction: 0.8)
+                                        .delay(Double(index) * 0.05 + 0.15),
                                     value: appeared
                                 )
                             }
@@ -561,8 +575,16 @@ struct MainView: View {
         .sheet(item: $editingProfile) { profile in
             EditProfileSheet(profile: profile, manager: manager, themeManager: themeManager)
         }
+        .alert("Something went wrong", isPresented: Binding(
+            get: { manager.lastError != nil },
+            set: { if !$0 { manager.lastError = nil } }
+        )) {
+            Button("OK", role: .cancel) { manager.lastError = nil }
+        } message: {
+            Text(manager.lastError ?? "")
+        }
         .onAppear {
-            withAnimation(.spring(response: 0.5, dampingFraction: 0.8).delay(0.1)) {
+            withAnimation(reduceMotion ? nil : .spring(response: 0.5, dampingFraction: 0.8).delay(0.1)) {
                 appeared = true
             }
         }
@@ -571,11 +593,11 @@ struct MainView: View {
 
 struct HeaderView: View {
     @ObservedObject var themeManager: ThemeManager
+    @Environment(\.openSettings) private var openSettings
     let isLoading: Bool
     let onRefresh: () -> Void
     let onAdd: () -> Void
-    let onSettings: () -> Void
-    
+
     var body: some View {
         HStack(spacing: 16) {
             // Logo
@@ -586,13 +608,13 @@ struct HeaderView: View {
                         .frame(width: 36, height: 36)
                     Image(systemName: "arrow.triangle.branch")
                         .font(.system(size: 16, weight: .semibold))
-                        .foregroundColor(.white)
+                        .foregroundColor(themeManager.accentForeground)
                 }
                 
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Git Switch")
                         .font(.system(size: 16, weight: .bold))
-                    Text("Identity Manager")
+                    Text("Profile Manager")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
@@ -606,9 +628,9 @@ struct HeaderView: View {
                     .help("Refresh")
                 
                 IconButton(icon: "plus", themeManager: themeManager, isPrimary: true, action: onAdd)
-                    .help("Add Context")
-                
-                IconButton(icon: "gearshape", action: onSettings)
+                    .help("Add Profile")
+
+                IconButton(icon: "gearshape", action: { openSettings() })
                     .help("Settings")
             }
         }
@@ -620,14 +642,26 @@ struct IconButton: View {
     var themeManager: ThemeManager? = nil
     var isLoading: Bool = false
     var isPrimary: Bool = false
+    var label: String? = nil
     let action: () -> Void
-    
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
     @State private var rotation: Double = 0
-    
+
+    private var a11yLabel: String {
+        if let label { return label }
+        switch icon {
+        case "arrow.clockwise": return "Refresh"
+        case "plus": return "Add profile"
+        case "gearshape": return "Settings"
+        default: return icon
+        }
+    }
+
     var body: some View {
         Button(action: {
-            if icon == "arrow.clockwise" && !isLoading {
+            if icon == "arrow.clockwise" && !isLoading && !reduceMotion {
                 withAnimation(.linear(duration: 0.6)) {
                     rotation += 360
                 }
@@ -636,21 +670,22 @@ struct IconButton: View {
         }) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isPrimary ? (themeManager?.accentColor ?? .blue) : (isHovering ? Color.primary.opacity(0.06) : Color.clear))
+                    .fill(isPrimary ? (themeManager?.accentColor ?? .blue) : Color.primary.opacity(isHovering ? 0.12 : 0.06))
                     .frame(width: 32, height: 32)
-                
+
                 Image(systemName: icon)
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(isPrimary ? .white : .primary)
+                    .foregroundColor(isPrimary ? (themeManager?.accentForeground ?? .white) : .primary)
                     .frame(width: 14, height: 14)
                     .rotationEffect(.degrees(icon == "arrow.clockwise" ? rotation : 0), anchor: .center)
             }
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(a11yLabel)
         .disabled(isLoading && icon == "arrow.clockwise")
         .opacity(isLoading && icon == "arrow.clockwise" ? 0.5 : 1)
         .onHover { hover in
-            withAnimation(.easeOut(duration: 0.15)) { isHovering = hover }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { isHovering = hover }
         }
     }
 }
@@ -658,11 +693,12 @@ struct IconButton: View {
 struct GlobalIdentityCard: View {
     @ObservedObject var manager: GitManager
     @ObservedObject var themeManager: ThemeManager
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isEditing = false
     @State private var editName = ""
     @State private var editEmail = ""
     @State private var isHovering = false
-    
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 16) {
@@ -674,7 +710,7 @@ struct GlobalIdentityCard: View {
                     
                     Text(initials)
                         .font(.system(size: 18, weight: .semibold, design: .rounded))
-                        .foregroundColor(.white)
+                        .foregroundColor(themeManager.accentForeground)
                 }
                 
                 VStack(alignment: .leading, spacing: 4) {
@@ -703,9 +739,10 @@ struct GlobalIdentityCard: View {
                 Spacer()
                 
                 Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
                         if isEditing {
-                            manager.saveGlobalConfig(name: editName, email: editEmail)
+                            manager.saveGlobalConfig(name: editName.trimmingCharacters(in: .whitespacesAndNewlines),
+                                                     email: editEmail.trimmingCharacters(in: .whitespacesAndNewlines))
                         } else {
                             editName = manager.globalName
                             editEmail = manager.globalEmail
@@ -713,9 +750,13 @@ struct GlobalIdentityCard: View {
                         isEditing.toggle()
                     }
                 } label: {
-                    Text(isEditing ? "Save" : "Edit")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(isEditing ? .white : .primary)
+                    HStack(spacing: 5) {
+                        Image(systemName: isEditing ? "checkmark" : "pencil")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(isEditing ? "Save" : "Edit")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                        .foregroundColor(isEditing ? themeManager.accentForeground : .primary)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
                         .background(
@@ -724,17 +765,18 @@ struct GlobalIdentityCard: View {
                         )
                 }
                 .buttonStyle(ScaleButtonStyle())
+                .accessibilityLabel(isEditing ? "Save global identity" : "Edit global identity")
             }
             .padding(20)
         }
         .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: Radius.card, style: .continuous)
                 .fill(Color(nsColor: .controlBackgroundColor))
-                .shadow(color: .black.opacity(isHovering ? 0.1 : 0.05), radius: isHovering ? 12 : 8, y: isHovering ? 4 : 2)
+                .cardShadow(hovering: isHovering)
         )
-        .scaleEffect(isHovering ? 1.005 : 1)
+        .scaleEffect(isHovering && !reduceMotion ? 1.01 : 1)
         .onHover { hover in
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { isHovering = hover }
+            withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) { isHovering = hover }
         }
     }
     
@@ -753,11 +795,12 @@ struct ProfileCard: View {
     let manager: GitManager
     @ObservedObject var themeManager: ThemeManager
     let onEdit: () -> Void
-    
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
     @State private var showDeleteAlert = false
     @State private var copyState: CopyState = .idle
-    
+
     enum CopyState { case idle, copied }
     
     var body: some View {
@@ -780,7 +823,7 @@ struct ProfileCard: View {
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
                 Text(profile.folder)
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -788,52 +831,51 @@ struct ProfileCard: View {
             
             Spacer()
             
-            // Actions
+            // Actions — always visible (never hover-gated) so they're discoverable and
+            // reachable by keyboard / VoiceOver.
             HStack(spacing: 6) {
                 ActionButton(
                     icon: copyState == .copied ? "checkmark" : "key.fill",
-                    color: copyState == .copied ? .green : .secondary
+                    color: copyState == .copied ? .green : .secondary,
+                    label: copyState == .copied ? "Copied" : "Copy SSH key"
                 ) {
                     if manager.copySSHKey(for: profile) {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                        withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.6)) {
                             copyState = .copied
                         }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                            withAnimation { copyState = .idle }
+                            withAnimation(reduceMotion ? nil : .default) { copyState = .idle }
                         }
                     }
                 }
                 .help("Copy SSH Key")
-                
-                ActionButton(icon: "pencil", color: .secondary, action: onEdit)
+
+                ActionButton(icon: "pencil", color: .secondary, label: "Edit profile", action: onEdit)
                     .help("Edit Profile")
-                
-                ActionButton(icon: "trash", color: .red.opacity(0.8)) {
+
+                ActionButton(icon: "trash", color: .red.opacity(0.8), label: "Delete profile") {
                     showDeleteAlert = true
                 }
                 .help("Delete Profile")
             }
-            .opacity(isHovering ? 1 : 0.4)
         }
         .padding(14)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: Radius.card, style: .continuous)
                 .fill(Color(nsColor: .controlBackgroundColor))
-                .shadow(color: .black.opacity(isHovering ? 0.08 : 0.03), radius: isHovering ? 8 : 4, y: isHovering ? 2 : 1)
+                .cardShadow(hovering: isHovering)
         )
-        .scaleEffect(isHovering ? 1.008 : 1)
+        .scaleEffect(isHovering && !reduceMotion ? 1.01 : 1)
         .onHover { hover in
-            withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) { isHovering = hover }
+            withAnimation(reduceMotion ? nil : .spring(response: 0.25, dampingFraction: 0.8)) { isHovering = hover }
         }
-        .alert("Delete Context?", isPresented: $showDeleteAlert) {
+        .alert("Delete Profile?", isPresented: $showDeleteAlert) {
             Button("Delete", role: .destructive) {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                    manager.deleteProfile(profile)
-                }
+                manager.deleteProfile(profile)
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This will remove the Git identity for '\(profile.folder)'.")
+            Text("This removes the \"\(profile.name)\" profile for \(profile.folder). The generated SSH key is kept.")
         }
     }
 }
@@ -841,11 +883,12 @@ struct ProfileCard: View {
 struct ActionButton: View {
     let icon: String
     let color: Color
+    var label: String = ""
     let action: () -> Void
-    
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
-    @State private var isPressed = false
-    
+
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
@@ -854,18 +897,14 @@ struct ActionButton: View {
                 .frame(width: 28, height: 28)
                 .background(
                     Circle()
-                        .fill(isHovering ? color.opacity(0.12) : Color.clear)
+                        // Faint persistent fill so the control reads as tappable at rest.
+                        .fill(isHovering ? color.opacity(0.16) : Color.primary.opacity(0.05))
                 )
-                .scaleEffect(isPressed ? 0.9 : 1)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ScaleButtonStyle())
+        .accessibilityLabel(label.isEmpty ? icon : label)
         .onHover { hover in
-            withAnimation(.easeOut(duration: 0.12)) { isHovering = hover }
-        }
-        .pressAction {
-            withAnimation(.spring(response: 0.2, dampingFraction: 0.6)) { isPressed = true }
-        } onRelease: {
-            withAnimation(.spring(response: 0.2, dampingFraction: 0.6)) { isPressed = false }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.12)) { isHovering = hover }
         }
     }
 }
@@ -886,17 +925,17 @@ struct EmptyStateView: View {
             }
             
             VStack(spacing: 4) {
-                Text("No contexts yet")
+                Text("No profiles yet")
                     .font(.system(size: 14, weight: .semibold))
-                Text("Create a context to auto-switch identities")
+                Text("Create a profile to auto-switch your Git identity by folder")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
             }
             
             Button(action: onAdd) {
-                Text("Add Context")
+                Text("Add Profile")
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.white)
+                    .foregroundColor(themeManager.accentForeground)
                     .padding(.horizontal, 20)
                     .padding(.vertical, 10)
                     .background(
@@ -947,7 +986,7 @@ struct AddProfileSheet: View {
                         .foregroundColor(themeManager.accentColor)
                 }
                 
-                Text("New Context")
+                Text("New Profile")
                     .font(.system(size: 18, weight: .bold))
                 Text("Auto-switch Git identity by folder")
                     .font(.system(size: 13))
@@ -967,7 +1006,7 @@ struct AddProfileSheet: View {
                 VStack(alignment: .leading, spacing: 6) {
                     SectionLabel(text: "FOLDER")
                     HStack(spacing: 8) {
-                        FormTextField(icon: "folder", placeholder: "Path to projects folder", text: $folder, themeManager: themeManager)
+                        FormTextField(icon: "folder", placeholder: "Folder this applies to (e.g. ~/Projects/Work)", text: $folder, themeManager: themeManager)
                         Button(action: selectFolder) {
                             Image(systemName: "ellipsis")
                                 .font(.system(size: 14, weight: .medium))
@@ -978,6 +1017,8 @@ struct AddProfileSheet: View {
                                 )
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("Choose folder")
+                        .help("Choose folder")
                     }
                 }
             }
@@ -1004,6 +1045,7 @@ struct AddProfileSheet: View {
                 Button("Cancel") { dismiss() }
                     .buttonStyle(.plain)
                     .foregroundColor(.secondary)
+                    .keyboardShortcut(.cancelAction)
                 
                 Spacer()
                 
@@ -1017,7 +1059,7 @@ struct AddProfileSheet: View {
                         Text(isGenerating ? "Creating..." : "Create")
                             .font(.system(size: 13, weight: .semibold))
                     }
-                    .foregroundColor(.white)
+                    .foregroundColor(themeManager.accentForeground)
                     .padding(.horizontal, 20)
                     .padding(.vertical, 8)
                     .background(
@@ -1026,11 +1068,12 @@ struct AddProfileSheet: View {
                     )
                 }
                 .buttonStyle(ScaleButtonStyle())
+                .keyboardShortcut(.defaultAction)
                 .disabled(!isValid || isGenerating)
             }
         }
         .padding(28)
-        .frame(width: 420)
+        .frame(width: 440)
     }
     
     func selectFolder() {
@@ -1086,7 +1129,7 @@ struct EditProfileSheet: View {
     var body: some View {
         VStack(spacing: 20) {
             VStack(spacing: 4) {
-                Text("Edit Identity")
+                Text("Edit Profile")
                     .font(.system(size: 16, weight: .semibold))
                 Text(profile.folder)
                     .font(.system(size: 11, design: .monospaced))
@@ -1104,74 +1147,61 @@ struct EditProfileSheet: View {
                 Button("Cancel") { dismiss() }
                     .buttonStyle(.plain)
                     .foregroundColor(.secondary)
+                    .keyboardShortcut(.cancelAction)
                 
                 Spacer()
                 
                 Button("Save") {
-                    manager.updateProfile(profile: profile, newName: name, newEmail: email)
+                    manager.updateProfile(profile: profile,
+                                          newName: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                                          newEmail: email.trimmingCharacters(in: .whitespacesAndNewlines))
                     dismiss()
                 }
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(.white)
+                .foregroundColor(themeManager.accentForeground)
                 .padding(.horizontal, 20)
                 .padding(.vertical, 8)
                 .background(Capsule().fill(themeManager.accentColor))
                 .buttonStyle(ScaleButtonStyle())
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || !isValidEmail(email.trimmingCharacters(in: .whitespacesAndNewlines)))
             }
         }
         .padding(28)
-        .frame(width: 380)
+        .frame(width: 440)
     }
 }
 
-struct SettingsSheet: View {
-    @Environment(\.dismiss) var dismiss
+struct SettingsView: View {
     @ObservedObject var themeManager: ThemeManager
-    
+
     var body: some View {
         VStack(spacing: 0) {
-            SettingsHeader(onDismiss: { dismiss() })
-            
+            HStack {
+                Text("Settings")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 16)
+
             Divider()
                 .padding(.horizontal, 20)
-            
+
             VStack(spacing: 20) {
                 AppearanceSection(themeManager: themeManager)
                 AccentColorSection(themeManager: themeManager)
             }
             .padding(20)
-            
-            Spacer()
-            
+
             Divider()
                 .padding(.horizontal, 20)
-            
+
             SettingsFooter()
         }
-        .frame(width: 320, height: 300)
-    }
-}
-
-struct SettingsHeader: View {
-    let onDismiss: () -> Void
-    
-    var body: some View {
-        HStack {
-            Text("Settings")
-                .font(.system(size: 15, weight: .semibold))
-            Spacer()
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.secondary)
-                    .frame(width: 22, height: 22)
-                    .background(Circle().fill(Color.primary.opacity(0.08)))
-            }
-            .buttonStyle(ScaleButtonStyle())
-        }
-        .padding(.horizontal, 20)
-        .padding(.top, 18)
-        .padding(.bottom, 20)
+        .frame(width: 360)
     }
 }
 
@@ -1182,7 +1212,7 @@ struct SettingsFooter: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.secondary)
             Spacer()
-            Text("v1.0.1")
+            Text(AppInfo.version)
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
         }
@@ -1216,14 +1246,15 @@ struct AppearanceSection: View {
 struct AppearanceModeButton: View {
     let mode: AppearanceMode
     @ObservedObject var themeManager: ThemeManager
-    
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     private var isSelected: Bool {
         themeManager.appearanceMode == mode
     }
-    
+
     var body: some View {
         Button {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
                 themeManager.appearanceMode = mode
             }
         } label: {
@@ -1233,7 +1264,7 @@ struct AppearanceModeButton: View {
                 Text(mode.displayName)
                     .font(.system(size: 12, weight: .medium))
             }
-            .foregroundColor(isSelected ? .white : .primary)
+            .foregroundColor(isSelected ? themeManager.accentForeground : .primary)
             .frame(maxWidth: .infinity)
             .frame(height: 32)
             .background(
@@ -1242,6 +1273,8 @@ struct AppearanceModeButton: View {
             )
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(mode.displayName)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 }
 
@@ -1276,14 +1309,15 @@ struct AccentColorSection: View {
 struct AccentColorButton: View {
     let theme: AppTheme
     @ObservedObject var themeManager: ThemeManager
-    
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     private var isSelected: Bool {
         themeManager.selectedTheme == theme
     }
-    
+
     var body: some View {
         Button {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+            withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.7)) {
                 themeManager.selectedTheme = theme
             }
         } label: {
@@ -1291,15 +1325,18 @@ struct AccentColorButton: View {
                 Circle()
                     .fill(theme.color)
                     .frame(width: 28, height: 28)
-                
+
                 if isSelected {
+                    // High-contrast ring drawn OUTSIDE the swatch so the selection reads
+                    // clearly in both light and dark mode (the old 30%-white inner ring
+                    // vanished on the bright accents).
                     Circle()
-                        .stroke(Color.white.opacity(0.3), lineWidth: 2)
-                        .frame(width: 28, height: 28)
-                    
+                        .strokeBorder(Color.primary.opacity(0.9), lineWidth: 2)
+                        .frame(width: 36, height: 36)
+
                     Image(systemName: "checkmark")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.white)
+                        .foregroundColor(theme.onAccent)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -1310,6 +1347,8 @@ struct AccentColorButton: View {
             )
         }
         .buttonStyle(ScaleButtonStyle())
+        .accessibilityLabel(theme.displayName)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 }
 
@@ -1319,7 +1358,7 @@ struct SectionLabel: View {
     let text: String
     var body: some View {
         Text(text)
-            .font(.system(size: 10, weight: .bold))
+            .font(.system(size: 11, weight: .bold))
             .foregroundStyle(.tertiary)
             .tracking(0.5)
     }
@@ -1390,27 +1429,5 @@ struct ScaleButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(.spring(response: 0.2, dampingFraction: 0.7), value: configuration.isPressed)
-    }
-}
-
-// MARK: - PRESS ACTION MODIFIER
-
-struct PressActions: ViewModifier {
-    var onPress: () -> Void
-    var onRelease: () -> Void
-    
-    func body(content: Content) -> some View {
-        content
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { _ in onPress() }
-                    .onEnded { _ in onRelease() }
-            )
-    }
-}
-
-extension View {
-    func pressAction(onPress: @escaping () -> Void, onRelease: @escaping () -> Void) -> some View {
-        modifier(PressActions(onPress: onPress, onRelease: onRelease))
     }
 }

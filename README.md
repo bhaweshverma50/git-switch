@@ -168,9 +168,12 @@ When you run any Git command in a folder matching the `gitdir` pattern, Git auto
 
 ### Requirements
 
-- macOS 14.0 (Sonoma) or later
+- macOS 15.0 (Sequoia) or later
 - Xcode 16.0 or later
 - `git` available on your `PATH` (the app shells out to it)
+
+> Git Switch runs as a **menu-bar-only app** (no Dock icon): launch it and use the
+> menu-bar ⑃ icon; "Open App" shows the full management window.
 
 ### Steps
 
